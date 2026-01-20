@@ -1,0 +1,22 @@
+{
+  "appId": "com.audio.trackselector",
+  "productName": "Audio Track Selector",
+  "files": [
+    "main/dist/**",
+    "renderer/dist/**",
+    "package.json"
+  ],
+  "directories": {
+    "output": "dist"
+  },
+  "asar": true,
+  "win": {
+    "target": "nsis"
+  },
+  "mac": {
+    "target": "dmg"
+  },
+  "linux": {
+    "target": "AppImage"
+  }
+}
