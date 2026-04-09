@@ -6,12 +6,34 @@
     "renderer/dist/**",
     "package.json"
   ],
+  "extraResources": [
+    {
+      "from": "node_modules/ffmpeg-static",
+      "to": "bin",
+      "filter": [
+        "ffmpeg.exe"
+      ]
+    },
+    {
+      "from": "node_modules/ffprobe-static/bin/win32/x64",
+      "to": "bin",
+      "filter": [
+        "ffprobe.exe"
+      ]
+    }
+  ],
   "directories": {
     "output": "dist"
   },
   "asar": true,
+  "asarUnpack": [
+    "**/node_modules/ffmpeg-static/**",
+    "**/node_modules/ffprobe-static/**"
+  ],
   "win": {
-    "target": "nsis"
+    "target": [
+      "zip"
+    ]
   },
   "mac": {
     "target": "dmg"

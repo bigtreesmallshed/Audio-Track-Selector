@@ -51,15 +51,69 @@ npm run build
 npm run package
 ```
 
-The packaged app will be emitted to `dist/` (NSIS for Windows, DMG for macOS, AppImage for Linux).
+The packaged app will be emitted to `dist/` (`zip` portable bundle for Windows, DMG for macOS, AppImage for Linux).
+
+### Build Windows Portable Bundle
+
+```bash
+npm run package:win-portable
+```
+
+This produces a `dist/*win*.zip` bundle containing a runnable `win-unpacked/` folder instead of an installer.
+
+## Portable Windows Distribution
+
+Portable mode is enabled only when all of these are true:
+
+- running a packaged build on Windows
+- and a `.portable` marker file (or `portable-mode.json`) exists next to the app `.exe`
+
+You can also force portable mode in development by setting:
+
+```bash
+AUDIO_TRACK_SELECTOR_PORTABLE=1
+```
+
+### Expected Portable Folder Layout
+
+```text
+Audio Track Selector/
+├─ Audio Track Selector.exe
+├─ .portable
+├─ bin/
+│  ├─ ffmpeg.exe
+│  └─ ffprobe.exe
+└─ data/
+   ├─ config/      (Electron userData)
+   ├─ logs/        (Electron log files)
+   ├─ session/     (Chromium session data)
+   └─ temp/        (extraction temp directories)
+```
+
+### Moving Between PCs
+
+- Close the app first.
+- Copy the entire app folder (including `.portable`, `bin/`, and `data/`) to another Windows PC.
+- Launch `Audio Track Selector.exe` from that copied folder.
+
+### Tradeoffs vs Single-EXE Packaging
+
+- Folder-based distribution is easier to inspect and replace binaries (`bin/ffmpeg.exe`, `bin/ffprobe.exe`).
+- No installer means no Start Menu shortcuts or automatic uninstaller.
+- Portable mode keeps app state with the app folder, which is ideal for move/copy workflows but can grow in size over time.
 
 ## Temp Files
 
-Each session creates a temporary directory in your OS temp location named:
+Each session creates a temporary directory named:
 
 ```
 audio-track-selector-<random>
 ```
+
+Location depends on mode:
+
+- portable mode: `<app folder>/data/temp/`
+- non-portable mode: OS temp directory
 
 It is cleaned up when:
 
