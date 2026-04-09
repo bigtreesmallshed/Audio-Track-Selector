@@ -67,6 +67,7 @@ Portable mode is enabled only when all of these are true:
 
 - running a packaged build on Windows
 - and a `.portable` marker file (or `portable-mode.json`) exists next to the app `.exe`
+- and the app can create/write `data/config`, `data/logs`, `data/session`, and `data/temp`
 
 You can also force portable mode in development by setting:
 
@@ -101,12 +102,15 @@ Binary resolution order is:
 3. `ffmpeg-static` / `ffprobe-static`,
 4. system `PATH`.
 
+At startup, the app logs the resolved portable mode state and checks that resolved ffmpeg/ffprobe binaries are readable. If a binary cannot be started, the error now includes every lookup location that was checked.
+
 ### Moving Between PCs
 
 - Close the app first.
 - Copy the entire `win-unpacked/` folder (including `.portable`, `resources/bin/`, and `data/`) to another Windows PC.
 - Launch `Audio Track Selector.exe` from the copied `win-unpacked/` folder.
 - Avoid launching portable mode from protected folders (for example `C:\Program Files`) because Windows may block writes to `data/`.
+- If portable mode is requested but `data/*` is not writable, the app logs a warning and falls back to standard (non-portable) Electron data paths.
 
 ### Tradeoffs vs Single-EXE Packaging
 
@@ -132,6 +136,7 @@ It is cleaned up when:
 - the app closes
 - a new file is opened
 - the renderer requests cleanup
+- stale `audio-track-selector-*` temp directories older than 48 hours are pruned on startup (best effort)
 
 ## Troubleshooting
 

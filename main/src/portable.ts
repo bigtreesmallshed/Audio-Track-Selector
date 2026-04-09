@@ -6,12 +6,14 @@ import ffprobeStatic from "ffprobe-static";
 
 type PortablePaths = {
   enabled: boolean;
+  requested: boolean;
   portableRoot: string;
   dataRoot: string;
   configDir: string;
   logsDir: string;
   tempDir: string;
   sessionDir: string;
+  disabledReason?: string;
 };
 
 const PORTABLE_ENV_FLAG = "AUDIO_TRACK_SELECTOR_PORTABLE";
@@ -40,9 +42,11 @@ const shouldUsePortableMode = (portableRoot: string) => {
 const createPortablePaths = (): PortablePaths => {
   const portableRoot = resolvePortableRoot();
   const dataRoot = path.join(portableRoot, "data");
+  const requested = shouldUsePortableMode(portableRoot);
 
   return {
-    enabled: shouldUsePortableMode(portableRoot),
+    enabled: requested,
+    requested,
     portableRoot,
     dataRoot,
     configDir: path.join(dataRoot, "config"),
@@ -85,6 +89,7 @@ export const initializePortablePaths = () => {
     app.setAppLogsPath(portablePaths.logsDir);
   } catch (error) {
     portablePaths.enabled = false;
+    portablePaths.disabledReason = (error as Error).message;
     // eslint-disable-next-line no-console
     console.warn(
       `Portable mode requested but could not initialize writable data directories in ${portablePaths.dataRoot}: ${(error as Error).message}`
@@ -139,6 +144,32 @@ export const resolveFfprobePath = () => {
   ]);
 
   return resolved ?? fromPath;
+};
+
+export const getFfmpegCandidates = () => {
+  const fromStaticPackage = typeof ffmpegStatic === "string" ? ffmpegStatic : "";
+  const fromPath = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  return [
+    resolvePortableBinPath("ffmpeg"),
+    resolvePackagedBinPath("ffmpeg"),
+    fromStaticPackage,
+    fromPath
+  ].filter(Boolean);
+};
+
+export const getFfprobeCandidates = () => {
+  const fromStaticPackage = typeof ffprobeStatic === "object" && ffprobeStatic?.path
+    ? ffprobeStatic.path
+    : typeof ffprobeStatic === "string"
+      ? ffprobeStatic
+      : "";
+  const fromPath = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+  return [
+    resolvePortableBinPath("ffprobe"),
+    resolvePackagedBinPath("ffprobe"),
+    fromStaticPackage,
+    fromPath
+  ].filter(Boolean);
 };
 
 export const getPortableModeInfo = () => portablePaths;
