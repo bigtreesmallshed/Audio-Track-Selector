@@ -3,6 +3,8 @@ import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
 import {
+  getFfmpegCandidates,
+  getFfprobeCandidates,
   getPortableModeInfo,
   initializePortablePaths,
   resolveFfmpegPath,
@@ -21,6 +23,8 @@ const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
 let mainWindow: BrowserWindow | null = null;
 let tempDir: string | null = null;
+const TEMP_DIR_PREFIX = "audio-track-selector-";
+const STALE_TEMP_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 2;
 
 const logToRenderer = (event: LogEvent) => {
   if (mainWindow) {
@@ -32,7 +36,7 @@ const ensureTempDir = async () => {
   if (tempDir) {
     return tempDir;
   }
-  const base = path.join(app.getPath("temp"), "audio-track-selector-");
+  const base = path.join(app.getPath("temp"), TEMP_DIR_PREFIX);
   tempDir = await fs.mkdtemp(base);
   return tempDir;
 };
@@ -50,6 +54,67 @@ const cleanupTempDir = async () => {
     });
   }
   tempDir = null;
+};
+
+const cleanupStaleTempDirs = async () => {
+  const tempRoot = app.getPath("temp");
+  try {
+    const entries = await fs.readdir(tempRoot, { withFileTypes: true });
+    const now = Date.now();
+    await Promise.all(entries.map(async (entry) => {
+      if (!entry.isDirectory() || !entry.name.startsWith(TEMP_DIR_PREFIX)) {
+        return;
+      }
+
+      const fullPath = path.join(tempRoot, entry.name);
+      const stats = await fs.stat(fullPath);
+      if (now - stats.mtimeMs < STALE_TEMP_MAX_AGE_MS) {
+        return;
+      }
+
+      try {
+        await fs.rm(fullPath, { recursive: true, force: true });
+      } catch (error) {
+        logToRenderer({
+          level: "info",
+          message: `Could not remove stale temp directory ${fullPath}: ${(error as Error).message}`
+        });
+      }
+    }));
+  } catch (error) {
+    logToRenderer({
+      level: "info",
+      message: `Unable to scan temp root for stale directories: ${(error as Error).message}`
+    });
+  }
+};
+
+const formatBinaryError = (
+  binaryName: "ffmpeg" | "ffprobe",
+  error: Error
+) => {
+  const candidates = binaryName === "ffmpeg" ? getFfmpegCandidates() : getFfprobeCandidates();
+  const lookup = candidates.map((candidate) => `- ${candidate}`).join("\n");
+  return `${binaryName} failed to start: ${error.message}\nChecked locations:\n${lookup}\n` +
+    `If running portable mode, place ${binaryName}.exe in "bin" next to the app executable.`;
+};
+
+const checkBinaryReadable = async (binaryName: "ffmpeg" | "ffprobe", resolvedPath: string) => {
+  const binaryIsPathLike = resolvedPath.includes(path.sep) || resolvedPath.includes("/");
+  if (!binaryIsPathLike) {
+    return;
+  }
+
+  try {
+    await fs.access(resolvedPath);
+  } catch {
+    const candidates = binaryName === "ffmpeg" ? getFfmpegCandidates() : getFfprobeCandidates();
+    const shortList = candidates.map((candidate) => `"${candidate}"`).join(", ");
+    logToRenderer({
+      level: "info",
+      message: `${binaryName} executable was resolved to "${resolvedPath}" but is not readable. Lookup order: ${shortList}`
+    });
+  }
 };
 
 const createWindow = () => {
@@ -86,7 +151,7 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
   ];
 
   return new Promise((resolve, reject) => {
-    const child = spawn(ffprobePath, args);
+    const child = spawn(ffprobePath, args, { windowsHide: true });
     let output = "";
     let errorOutput = "";
 
@@ -145,7 +210,7 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
       }
     });
 
-    child.on("error", (error) => reject(error));
+    child.on("error", (error) => reject(new Error(formatBinaryError("ffprobe", error))));
   });
 };
 
@@ -181,7 +246,7 @@ const runFfmpegExtraction = async (
   ];
 
   return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args);
+    const child = spawn(ffmpegPath, args, { windowsHide: true });
     let stderr = "";
     let buffer = "";
 
@@ -218,7 +283,7 @@ const runFfmpegExtraction = async (
       resolve({ audioIndex: request.audioIndex, outputPath });
     });
 
-    child.on("error", (error) => reject(error));
+    child.on("error", (error) => reject(new Error(formatBinaryError("ffmpeg", error))));
   });
 };
 
@@ -226,6 +291,7 @@ initializePortablePaths();
 
 app.on("ready", () => {
   createWindow();
+  void cleanupStaleTempDirs();
 
   const portableInfo = getPortableModeInfo();
   if (portableInfo.enabled) {
@@ -233,7 +299,17 @@ app.on("ready", () => {
       level: "info",
       message: `Portable mode enabled at ${portableInfo.portableRoot}`
     });
+  } else if (portableInfo.requested && portableInfo.disabledReason) {
+    logToRenderer({
+      level: "info",
+      message:
+        `Portable mode was requested but disabled because data folders are not writable at ` +
+        `${portableInfo.dataRoot}: ${portableInfo.disabledReason}. Falling back to default app data paths.`
+    });
   }
+
+  void checkBinaryReadable("ffmpeg", resolveFfmpegPath());
+  void checkBinaryReadable("ffprobe", resolveFfprobePath());
 
   ipcMain.handle("open-file", async () => {
     const result = await dialog.showOpenDialog({
