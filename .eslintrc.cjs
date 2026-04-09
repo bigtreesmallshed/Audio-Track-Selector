@@ -19,5 +19,18 @@ module.exports = {
   },
   rules: {
     "react/react-in-jsx-scope": "off"
-  }
+  },
+  overrides: [
+    {
+      files: ["**/*.{ts,tsx}"],
+      rules: {
+        "no-undef": "off",
+        "no-unused-vars": "off",
+        "@typescript-eslint/no-unused-vars": [
+          "error",
+          { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }
+        ]
+      }
+    }
+  ]
 };

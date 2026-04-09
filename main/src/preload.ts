@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { IpcRendererEvent } from "electron";
 import { pathToFileURL } from "url";
 import type {
   ExtractProgressEvent,
@@ -6,7 +7,7 @@ import type {
   ExtractTrackResponse,
   LogEvent,
   ProbeResult
-} from "@shared/types";
+} from "./ipc-types";
 
 const api = {
   openFile: (): Promise<string | null> => ipcRenderer.invoke("open-file"),
@@ -16,13 +17,13 @@ const api = {
     ipcRenderer.invoke("extract-track", request),
   cleanupTemp: (): Promise<void> => ipcRenderer.invoke("cleanup-temp"),
   onExtractProgress: (callback: (event: ExtractProgressEvent) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, data: ExtractProgressEvent) =>
+    const listener = (_event: IpcRendererEvent, data: ExtractProgressEvent) =>
       callback(data);
     ipcRenderer.on("extract-progress", listener);
     return () => ipcRenderer.removeListener("extract-progress", listener);
   },
   onLog: (callback: (event: LogEvent) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, data: LogEvent) =>
+    const listener = (_event: IpcRendererEvent, data: LogEvent) =>
       callback(data);
     ipcRenderer.on("log", listener);
     return () => ipcRenderer.removeListener("log", listener);
