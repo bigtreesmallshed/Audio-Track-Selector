@@ -1,5 +1,5 @@
 import { app } from "electron";
-import { existsSync, mkdirSync } from "fs";
+import { accessSync, constants, existsSync, mkdirSync, writeFileSync, unlinkSync } from "fs";
 import path from "path";
 import ffmpegStatic from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
@@ -60,20 +60,36 @@ const ensureDirectory = (directoryPath: string) => {
   }
 };
 
+const ensureDirectoryWritable = (directoryPath: string) => {
+  ensureDirectory(directoryPath);
+  accessSync(directoryPath, constants.W_OK);
+  const probePath = path.join(directoryPath, ".write-test");
+  writeFileSync(probePath, "");
+  unlinkSync(probePath);
+};
+
 export const initializePortablePaths = () => {
   if (!portablePaths.enabled) {
     return portablePaths;
   }
 
-  ensureDirectory(portablePaths.configDir);
-  ensureDirectory(portablePaths.logsDir);
-  ensureDirectory(portablePaths.tempDir);
-  ensureDirectory(portablePaths.sessionDir);
+  try {
+    ensureDirectoryWritable(portablePaths.configDir);
+    ensureDirectoryWritable(portablePaths.logsDir);
+    ensureDirectoryWritable(portablePaths.tempDir);
+    ensureDirectoryWritable(portablePaths.sessionDir);
 
-  app.setPath("userData", portablePaths.configDir);
-  app.setPath("temp", portablePaths.tempDir);
-  app.setPath("sessionData", portablePaths.sessionDir);
-  app.setAppLogsPath(portablePaths.logsDir);
+    app.setPath("userData", portablePaths.configDir);
+    app.setPath("temp", portablePaths.tempDir);
+    app.setPath("sessionData", portablePaths.sessionDir);
+    app.setAppLogsPath(portablePaths.logsDir);
+  } catch (error) {
+    portablePaths.enabled = false;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `Portable mode requested but could not initialize writable data directories in ${portablePaths.dataRoot}: ${(error as Error).message}`
+    );
+  }
 
   return portablePaths;
 };
