@@ -2,9 +2,12 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
-import os from "os";
-import ffmpegStatic from "ffmpeg-static";
-import ffprobeStatic from "ffprobe-static";
+import {
+  getPortableModeInfo,
+  initializePortablePaths,
+  resolveFfmpegPath,
+  resolveFfprobePath
+} from "./portable";
 import type {
   AudioTrackInfo,
   ExtractProgressEvent,
@@ -25,21 +28,11 @@ const logToRenderer = (event: LogEvent) => {
   }
 };
 
-const resolveBinary = (candidate: string | null | undefined, fallbackName: string) => {
-  if (candidate && candidate.length > 0) {
-    return candidate;
-  }
-  return fallbackName;
-};
-
-const getFfprobePath = () => resolveBinary(ffprobeStatic as string | null, "ffprobe");
-const getFfmpegPath = () => resolveBinary(ffmpegStatic as string | null, "ffmpeg");
-
 const ensureTempDir = async () => {
   if (tempDir) {
     return tempDir;
   }
-  const base = path.join(os.tmpdir(), "audio-track-selector-");
+  const base = path.join(app.getPath("temp"), "audio-track-selector-");
   tempDir = await fs.mkdtemp(base);
   return tempDir;
 };
@@ -79,7 +72,7 @@ const createWindow = () => {
 };
 
 const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
-  const ffprobePath = getFfprobePath();
+  const ffprobePath = resolveFfprobePath();
   logToRenderer({ level: "info", message: `Running ffprobe: ${ffprobePath}` });
 
   const args = [
@@ -159,7 +152,7 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
 const runFfmpegExtraction = async (
   request: ExtractTrackRequest
 ): Promise<ExtractTrackResponse> => {
-  const ffmpegPath = getFfmpegPath();
+  const ffmpegPath = resolveFfmpegPath();
   const outputDir = await ensureTempDir();
   const outputPath = path.join(outputDir, `track_${request.audioIndex}.wav`);
 
@@ -229,8 +222,18 @@ const runFfmpegExtraction = async (
   });
 };
 
+initializePortablePaths();
+
 app.on("ready", () => {
   createWindow();
+
+  const portableInfo = getPortableModeInfo();
+  if (portableInfo.enabled) {
+    logToRenderer({
+      level: "info",
+      message: `Portable mode enabled at ${portableInfo.portableRoot}`
+    });
+  }
 
   ipcMain.handle("open-file", async () => {
     const result = await dialog.showOpenDialog({

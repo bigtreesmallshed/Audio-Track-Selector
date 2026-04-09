@@ -13,7 +13,8 @@
     "build:renderer": "vite build --config renderer/vite.config.ts",
     "build:main": "tsc -p main/tsconfig.json",
     "lint": "eslint \"main/src/**/*.{ts,tsx}\" \"renderer/src/**/*.{ts,tsx}\" \"shared/src/**/*.ts\"",
-    "package": "npm run build && electron-builder --config build/electron-builder.json"
+    "package": "npm run build && electron-builder --config build/electron-builder.json",
+    "package:win-portable": "npm run build && electron-builder --config build/electron-builder.json --win zip"
   },
   "dependencies": {
     "ffmpeg-static": "^5.2.0",
