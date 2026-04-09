@@ -78,23 +78,35 @@ AUDIO_TRACK_SELECTOR_PORTABLE=1
 
 ```text
 Audio Track Selector/
-├─ Audio Track Selector.exe
-├─ .portable
-├─ bin/
-│  ├─ ffmpeg.exe
-│  └─ ffprobe.exe
-└─ data/
-   ├─ config/      (Electron userData)
-   ├─ logs/        (Electron log files)
-   ├─ session/     (Chromium session data)
-   └─ temp/        (extraction temp directories)
+└─ win-unpacked/
+   ├─ Audio Track Selector.exe
+   ├─ .portable                      (create this next to the .exe)
+   ├─ bin/                           (optional override location for ffmpeg/ffprobe)
+   │  ├─ ffmpeg.exe
+   │  └─ ffprobe.exe
+   ├─ data/
+   │  ├─ config/                     (Electron userData)
+   │  ├─ logs/                       (Electron log files)
+   │  ├─ session/                    (Chromium session data)
+   │  └─ temp/                       (extraction temp directories)
+   └─ resources/
+      └─ bin/                        (packaged default location for ffmpeg/ffprobe)
+         ├─ ffmpeg.exe
+         └─ ffprobe.exe
 ```
+
+Binary resolution order is:
+1. `<exe folder>/bin` (portable override),
+2. `<exe folder>/resources/bin` (packaged default),
+3. `ffmpeg-static` / `ffprobe-static`,
+4. system `PATH`.
 
 ### Moving Between PCs
 
 - Close the app first.
-- Copy the entire app folder (including `.portable`, `bin/`, and `data/`) to another Windows PC.
-- Launch `Audio Track Selector.exe` from that copied folder.
+- Copy the entire `win-unpacked/` folder (including `.portable`, `resources/bin/`, and `data/`) to another Windows PC.
+- Launch `Audio Track Selector.exe` from the copied `win-unpacked/` folder.
+- Avoid launching portable mode from protected folders (for example `C:\Program Files`) because Windows may block writes to `data/`.
 
 ### Tradeoffs vs Single-EXE Packaging
 
