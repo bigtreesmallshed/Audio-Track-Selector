@@ -8,11 +8,7 @@
     "moduleResolution": "node",
     "types": ["node"],
     "allowJs": false,
-    "sourceMap": true,
-    "baseUrl": ".",
-    "paths": {
-      "@shared/*": ["../shared/src/*"]
-    }
+    "sourceMap": true
   },
-  "include": ["src/**/*", "../shared/src/**/*"]
+  "include": ["src/**/*"]
 }

@@ -15,7 +15,7 @@ import type {
   ExtractTrackResponse,
   LogEvent,
   ProbeResult
-} from "@shared/types";
+} from "./ipc-types";
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
