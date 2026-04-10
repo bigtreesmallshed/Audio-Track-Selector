@@ -1,6 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import { pathToFileURL } from "node:url";
 import type {
   ExtractProgressEvent,
   ExtractTrackRequest,
@@ -8,6 +7,49 @@ import type {
   LogEvent,
   ProbeResult
 } from "./ipc-types";
+
+const encodePathSegment = (segment: string) => encodeURIComponent(segment);
+
+const toFileUrl = (filePath: string): string => {
+  if (!filePath) {
+    throw new Error("Cannot convert empty file path to file URL");
+  }
+
+  if (filePath.startsWith("file://")) {
+    return filePath;
+  }
+
+  const normalized = filePath.replace(/\\/g, "/");
+
+  if (normalized.startsWith("//")) {
+    const trimmed = normalized.replace(/^\/+/, "");
+    const [host, ...parts] = trimmed.split("/");
+    if (!host) {
+      throw new Error(`Invalid UNC path: ${filePath}`);
+    }
+    const encodedPath = parts.map(encodePathSegment).join("/");
+    return encodedPath ? `file://${host}/${encodedPath}` : `file://${host}`;
+  }
+
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    const [drive, ...parts] = normalized.split("/");
+    const encodedPath = parts.map(encodePathSegment).join("/");
+    return encodedPath
+      ? `file:///${drive}/${encodedPath}`
+      : `file:///${drive}`;
+  }
+
+  if (normalized.startsWith("/")) {
+    const encodedPath = normalized
+      .split("/")
+      .map((segment, index) => (index === 0 ? "" : encodePathSegment(segment)))
+      .join("/");
+    return `file://${encodedPath}`;
+  }
+
+  const encodedPath = normalized.split("/").map(encodePathSegment).join("/");
+  return `file://${encodedPath}`;
+};
 
 const api = {
   openFile: (): Promise<string | null> => ipcRenderer.invoke("open-file"),
@@ -28,7 +70,7 @@ const api = {
     ipcRenderer.on("log", listener);
     return () => ipcRenderer.removeListener("log", listener);
   },
-  toFileUrl: (filePath: string) => pathToFileURL(filePath).toString()
+  toFileUrl
 };
 
 contextBridge.exposeInMainWorld("api", api);
