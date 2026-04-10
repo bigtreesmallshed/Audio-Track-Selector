@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
+import { pathToFileURL } from "url";
 import {
   getFfmpegCandidates,
   getFfprobeCandidates,
@@ -133,13 +134,42 @@ const createWindow = () => {
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     const rendererEntryPath = path.join(app.getAppPath(), "renderer", "dist", "index.html");
-    mainWindow.loadFile(rendererEntryPath).catch((error) => {
-      dialog.showErrorBox(
-        "Renderer Load Failure",
-        `Renderer failed to load (${(error as { code?: string }).code ?? "unknown"}): ${error.message}\n\n` +
-          `Attempted path:\n${rendererEntryPath}`
-      );
-    });
+    const isUncPath = rendererEntryPath.startsWith("\\\\");
+
+    fs.access(rendererEntryPath)
+      .then(() => true)
+      .catch(() => false)
+      .then((rendererEntryExists) => {
+        const rendererEntryUrl = pathToFileURL(rendererEntryPath).toString();
+        const loadTarget = isUncPath ? "UNC/network-share path" : "local path";
+        console.info(
+          `[renderer-load] mode=packaged target=${loadTarget} path="${rendererEntryPath}" exists=${rendererEntryExists} url="${rendererEntryUrl}"`
+        );
+
+        return mainWindow?.loadURL(rendererEntryUrl).catch((error) => {
+          const details = [
+            `Renderer failed to load (${(error as { code?: string }).code ?? "unknown"}): ${error.message}`,
+            "",
+            `Resolved filesystem path (${loadTarget}):`,
+            rendererEntryPath,
+            "",
+            `Exists: ${rendererEntryExists}`,
+            "",
+            "Resolved file URL:",
+            rendererEntryUrl
+          ];
+
+          if (isUncPath) {
+            details.push(
+              "",
+              "Direct execution from a network-share path can still be blocked by Windows/Electron policy.",
+              "If this persists, copy the full portable folder to a local drive and launch it there."
+            );
+          }
+
+          dialog.showErrorBox("Renderer Load Failure", details.join("\n"));
+        });
+      });
   }
 };
 
