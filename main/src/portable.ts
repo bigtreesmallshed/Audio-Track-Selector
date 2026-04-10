@@ -137,11 +137,12 @@ export const resolveFfprobePath = () => {
       ? ffprobeStatic
       : "";
   const fromPath = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
-  const resolved = resolveExistingPath([
+  const candidates = [
     resolvePortableBinPath("ffprobe"),
     resolvePackagedBinPath("ffprobe"),
-    fromStaticPackage
-  ]);
+    ...(!app.isPackaged && fromStaticPackage ? [fromStaticPackage] : [])
+  ];
+  const resolved = resolveExistingPath(candidates);
 
   return resolved ?? fromPath;
 };
@@ -167,7 +168,7 @@ export const getFfprobeCandidates = () => {
   return [
     resolvePortableBinPath("ffprobe"),
     resolvePackagedBinPath("ffprobe"),
-    fromStaticPackage,
+    ...(!app.isPackaged && fromStaticPackage ? [fromStaticPackage] : []),
     fromPath
   ].filter(Boolean);
 };

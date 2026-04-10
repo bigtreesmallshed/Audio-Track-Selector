@@ -26,6 +26,7 @@ let mainWindow: BrowserWindow | null = null;
 let tempDir: string | null = null;
 const TEMP_DIR_PREFIX = "audio-track-selector-";
 const STALE_TEMP_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 2;
+const FFPROBE_TIMEOUT_MS = 30_000;
 
 const logToRenderer = (event: LogEvent) => {
   if (mainWindow) {
@@ -133,17 +134,17 @@ const createWindow = () => {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL as string);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    const rendererEntryPath = path.join(app.getAppPath(), "renderer", "dist", "index.html");
-    const isUncPath = rendererEntryPath.startsWith("\\\\");
+    const packagedRendererPath = path.resolve(app.getAppPath(), "renderer", "dist", "index.html");
+    const isUncPath = packagedRendererPath.startsWith("\\\\");
 
-    fs.access(rendererEntryPath)
+    fs.access(packagedRendererPath)
       .then(() => true)
       .catch(() => false)
       .then((rendererEntryExists) => {
-        const rendererEntryUrl = pathToFileURL(rendererEntryPath).toString();
+        const rendererEntryUrl = pathToFileURL(packagedRendererPath).toString();
         const loadTarget = isUncPath ? "UNC/network-share path" : "local path";
         console.info(
-          `[renderer-load] mode=packaged target=${loadTarget} path="${rendererEntryPath}" exists=${rendererEntryExists} url="${rendererEntryUrl}"`
+          `[renderer-load] mode=packaged target=${loadTarget} path="${packagedRendererPath}" exists=${rendererEntryExists} url="${rendererEntryUrl}"`
         );
 
         return mainWindow?.loadURL(rendererEntryUrl).catch((error) => {
@@ -151,12 +152,15 @@ const createWindow = () => {
             `Renderer failed to load (${(error as { code?: string }).code ?? "unknown"}): ${error.message}`,
             "",
             `Resolved filesystem path (${loadTarget}):`,
-            rendererEntryPath,
+            packagedRendererPath,
             "",
             `Exists: ${rendererEntryExists}`,
             "",
             "Resolved file URL:",
-            rendererEntryUrl
+            rendererEntryUrl,
+            "",
+            "Raw error:",
+            String(error)
           ];
 
           if (isUncPath) {
@@ -191,6 +195,28 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
     const child = spawn(ffprobePath, args, { windowsHide: true });
     let output = "";
     let errorOutput = "";
+    let settled = false;
+
+    const finishWithError = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    };
+
+    const finishWithSuccess = (result: ProbeResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      finishWithError(new Error(`ffprobe timed out after ${FFPROBE_TIMEOUT_MS}ms`));
+    }, FFPROBE_TIMEOUT_MS);
 
     child.stdout.on("data", (data) => {
       output += data.toString();
@@ -201,8 +227,9 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
     });
 
     child.on("close", (code) => {
+      clearTimeout(timeout);
       if (code !== 0) {
-        return reject(
+        return finishWithError(
           new Error(
             `ffprobe exited with code ${code}. ${errorOutput.trim()}`
           )
@@ -235,7 +262,7 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
           ? Number(parsed.format.duration)
           : undefined;
 
-        resolve({
+        finishWithSuccess({
           filePath,
           duration,
           formatName: parsed.format?.format_name,
@@ -243,11 +270,14 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
           audioTracks
         });
       } catch (parseError) {
-        reject(parseError);
+        finishWithError(parseError as Error);
       }
     });
 
-    child.on("error", (error) => reject(new Error(formatBinaryError("ffprobe", error))));
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      finishWithError(new Error(formatBinaryError("ffprobe", error)));
+    });
   });
 };
 
@@ -365,8 +395,8 @@ app.on("ready", () => {
   });
 
   ipcMain.handle("probe-file", async (_event, filePath: string) => {
-    await cleanupTempDir();
     try {
+      await cleanupTempDir();
       const result = await runFfprobe(filePath);
       return result;
     } catch (error) {
@@ -374,7 +404,7 @@ app.on("ready", () => {
         level: "error",
         message: `Probe failed: ${(error as Error).message}`
       });
-      throw error;
+      return Promise.reject(error);
     }
   });
 
