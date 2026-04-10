@@ -94,7 +94,7 @@ export const App = () => {
 
     setStatus("Probing");
     setFilePath(selected);
-    setFileUrl(window.api.toFileUrl(selected));
+    setFileUrl(null);
     setProbeResult(null);
     setTracks([]);
     setLogs([]);
@@ -104,6 +104,7 @@ export const App = () => {
     setDuration(0);
 
     try {
+      setFileUrl(window.api.toFileUrl(selected));
       const result = await window.api.probeFile(selected);
       setProbeResult(result);
       setDuration(result.duration ?? 0);
@@ -120,8 +121,9 @@ export const App = () => {
       setStatus("Ready");
       log(`Probed ${result.audioTracks.length} audio track(s).`);
     } catch (error) {
+      setFileUrl(null);
       setStatus("Error");
-      log(`Probe failed: ${(error as Error).message}`);
+      log(`Open/probe failed: ${(error as Error).message}`);
     }
   };
 
@@ -197,7 +199,22 @@ export const App = () => {
     const audioContext = ensureAudioContext();
     const existing = audioNodesRef.current.get(audioIndex);
     if (!existing) {
-      const audioElement = new Audio(window.api.toFileUrl(outputPath));
+      let outputUrl: string;
+      try {
+        outputUrl = window.api.toFileUrl(outputPath);
+      } catch (error) {
+        setTracks((prev) =>
+          prev.map((track) =>
+            track.info.audioIndex === audioIndex
+              ? { ...track, error: `Audio URL failed: ${(error as Error).message}` }
+              : track
+          )
+        );
+        setStatus("Error");
+        return;
+      }
+
+      const audioElement = new Audio(outputUrl);
       audioElement.crossOrigin = "anonymous";
       audioElement.preload = "auto";
       audioElement.loop = false;

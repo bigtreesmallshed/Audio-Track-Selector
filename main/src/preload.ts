@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import { pathToFileURL } from "url";
+import { pathToFileURL } from "node:url";
 import type {
   ExtractProgressEvent,
   ExtractTrackRequest,
