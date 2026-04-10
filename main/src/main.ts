@@ -132,7 +132,14 @@ const createWindow = () => {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL as string);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    mainWindow.loadFile(path.join(__dirname, "../../renderer/dist/index.html"));
+    const rendererEntryPath = path.join(app.getAppPath(), "renderer", "dist", "index.html");
+    mainWindow.loadFile(rendererEntryPath).catch((error) => {
+      dialog.showErrorBox(
+        "Renderer Load Failure",
+        `Renderer failed to load (${(error as { code?: string }).code ?? "unknown"}): ${error.message}\n\n` +
+          `Attempted path:\n${rendererEntryPath}`
+      );
+    });
   }
 };
 
