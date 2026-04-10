@@ -109,6 +109,8 @@ At startup, the app logs the resolved portable mode state and checks that resolv
 - Close the app first.
 - Copy the entire `win-unpacked/` folder (including `.portable`, `resources/bin/`, and `data/`) to another Windows PC.
 - Launch `Audio Track Selector.exe` from the copied `win-unpacked/` folder.
+- Preferred: launch from a local drive folder (for example `C:\Apps\Audio Track Selector\win-unpacked\`).
+- Network-share (`\\SERVER\Share\...`) launches may work, but Windows/Electron security policy can still block renderer file loading on some systems. If you hit a renderer load error, copy the portable folder locally and run it there.
 - Avoid launching portable mode from protected folders (for example `C:\Program Files`) because Windows may block writes to `data/`.
 - If portable mode is requested but `data/*` is not writable, the app logs a warning and falls back to standard (non-portable) Electron data paths.
 
@@ -143,6 +145,7 @@ It is cleaned up when:
 - **ffprobe/ffmpeg not found**: Ensure they are on your `PATH`, or reinstall dependencies so `ffmpeg-static` and `ffprobe-static` can download the binaries.
 - **Extraction fails**: Check the Details panel for the exact `ffmpeg` error message.
 - **Audio out of sync**: Try pausing and resuming playback; the drift correction loop should realign audio within 250ms.
+- **Renderer load failure on network share**: The app now logs the resolved packaged `index.html` path, existence check, and final file URL. If this still fails from `\\SERVER\Share\...`, run the same `win-unpacked/` folder from a local path instead.
 
 ## Known Limitations
 
