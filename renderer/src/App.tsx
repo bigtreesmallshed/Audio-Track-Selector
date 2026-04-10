@@ -55,6 +55,7 @@ export const App = () => {
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [tracks, setTracks] = useState<TrackState[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const [lastError, setLastError] = useState<string | null>(null);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -93,6 +94,7 @@ export const App = () => {
     if (!selected) return;
 
     setStatus("Probing");
+    setLastError(null);
     setFilePath(selected);
     setFileUrl(null);
     setProbeResult(null);
@@ -121,9 +123,12 @@ export const App = () => {
       setStatus("Ready");
       log(`Probed ${result.audioTracks.length} audio track(s).`);
     } catch (error) {
-      setFileUrl(null);
+      const message = (error as Error).message;
       setStatus("Error");
-      log(`Open/probe failed: ${(error as Error).message}`);
+      setLastError(message);
+      setDetailsOpen(true);
+      log(`Open/probe failed: ${message}`);
+      console.error("Open/probe failed:", message);
     }
   };
 
@@ -425,6 +430,9 @@ export const App = () => {
           <div className={`status status-${status.toLowerCase()}`}>
             Status: {status}
           </div>
+          {lastError && (
+            <div className="error">Error: {lastError}</div>
+          )}
         </div>
       </header>
 

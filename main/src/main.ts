@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
-import { pathToFileURL } from "url";
+import { pathToFileURL } from "node:url";
 import {
   getFfmpegCandidates,
   getFfprobeCandidates,
@@ -179,7 +179,37 @@ const createWindow = () => {
 
 const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
   const ffprobePath = resolveFfprobePath();
-  logToRenderer({ level: "info", message: `Running ffprobe: ${ffprobePath}` });
+  const ffprobeCandidates = getFfprobeCandidates();
+  logToRenderer({ level: "info", message: `Probe target file: ${filePath}` });
+  logToRenderer({ level: "info", message: `App packaged: ${app.isPackaged}` });
+  logToRenderer({ level: "info", message: `process.resourcesPath: ${process.resourcesPath}` });
+  logToRenderer({ level: "info", message: `app.getAppPath(): ${app.getAppPath()}` });
+  logToRenderer({ level: "info", message: `Resolved ffprobe path: ${ffprobePath}` });
+  logToRenderer({
+    level: "info",
+    message: `ffprobe candidates: ${ffprobeCandidates.map((candidate) => `"${candidate}"`).join(", ")}`
+  });
+
+  const ffprobeIsPathLike = ffprobePath.includes(path.sep) || ffprobePath.includes("/");
+  if (ffprobeIsPathLike) {
+    try {
+      await fs.access(ffprobePath);
+      logToRenderer({
+        level: "info",
+        message: `Resolved ffprobe path is readable: "${ffprobePath}"`
+      });
+    } catch (error) {
+      logToRenderer({
+        level: "error",
+        message: `Resolved ffprobe path is not readable: "${ffprobePath}" (${(error as Error).message})`
+      });
+    }
+  } else {
+    logToRenderer({
+      level: "info",
+      message: `Resolved ffprobe path is not a concrete filesystem path: "${ffprobePath}"`
+    });
+  }
 
   const args = [
     "-v",
@@ -190,6 +220,7 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
     "-show_format",
     filePath
   ];
+  logToRenderer({ level: "info", message: `Spawning ffprobe with args: ${JSON.stringify(args)}` });
 
   return new Promise((resolve, reject) => {
     const child = spawn(ffprobePath, args, { windowsHide: true });
@@ -226,12 +257,16 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
       errorOutput += data.toString();
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timeout);
+      logToRenderer({
+        level: "info",
+        message: `ffprobe close: code=${code ?? "null"} signal=${signal ?? "null"} stdout_len=${output.length} stderr_len=${errorOutput.length}`
+      });
       if (code !== 0) {
         return finishWithError(
           new Error(
-            `ffprobe exited with code ${code}. ${errorOutput.trim()}`
+            `ffprobe exited with code ${code} (signal: ${signal ?? "none"}). stderr: ${errorOutput.trim() || "<empty>"}`
           )
         );
       }
@@ -270,7 +305,12 @@ const runFfprobe = async (filePath: string): Promise<ProbeResult> => {
           audioTracks
         });
       } catch (parseError) {
-        finishWithError(parseError as Error);
+        const stdoutPreview = output.slice(0, 500).trim();
+        const stderrPreview = errorOutput.slice(0, 500).trim();
+        finishWithError(new Error(
+          `Failed to parse ffprobe output: ${(parseError as Error).message}. ` +
+          `stdout preview: ${stdoutPreview || "<empty>"}. stderr preview: ${stderrPreview || "<empty>"}`
+        ));
       }
     });
 
