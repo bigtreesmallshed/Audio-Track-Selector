@@ -3,8 +3,7 @@ import "./App.css";
 import type {
   AppStatus,
   AudioTrackInfo,
-  ExtractProgressEvent,
-  ExtractTrackResponse,
+  DecoderPcmEvent,
   ProbeResult
 } from "@shared/types";
 
@@ -13,17 +12,19 @@ type TrackState = {
   enabled: boolean;
   muted: boolean;
   volume: number;
-  extracting: boolean;
-  progress: number;
   error?: string;
-  outputPath?: string;
 };
 
-type AudioNodeState = {
-  element: HTMLAudioElement;
-  source: MediaElementAudioSourceNode;
+type TrackAudioRuntime = {
   gain: GainNode;
+  nextStartAtSec: number;
+  scheduledSources: Set<AudioBufferSourceNode>;
 };
+
+const OUTPUT_SAMPLE_RATE = 48000;
+const OUTPUT_CHANNELS = 2;
+const START_SAFETY_SEC = 0.06;
+const MAX_QUEUE_SEC = 0.75;
 
 const formatTime = (value: number) => {
   const minutes = Math.floor(value / 60);
@@ -44,10 +45,66 @@ const buildTrackLabel = (track: AudioTrackInfo) => {
   return parts.join(" — ");
 };
 
+const isTypingTarget = (target: EventTarget | null) => {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  if (target.isContentEditable) {
+    return true;
+  }
+  const tagName = target.tagName.toLowerCase();
+  if (["input", "textarea", "select", "button", "option"].includes(tagName)) {
+    return true;
+  }
+  return target.closest("input, textarea, select, button, [contenteditable='true']") !== null;
+};
+
+const decodePcmBase64ToAudioBuffer = (
+  audioContext: AudioContext,
+  event: DecoderPcmEvent
+): AudioBuffer | null => {
+  const binary = atob(event.pcmBase64);
+  if (binary.length < 4) {
+    return null;
+  }
+
+  const sampleCount = Math.floor(binary.length / (2 * OUTPUT_CHANNELS));
+  if (sampleCount <= 0) {
+    return null;
+  }
+
+  const left = new Float32Array(sampleCount);
+  const right = new Float32Array(sampleCount);
+
+  for (let i = 0; i < sampleCount; i += 1) {
+    const frameOffset = i * OUTPUT_CHANNELS * 2;
+
+    const loL = binary.charCodeAt(frameOffset);
+    const hiL = binary.charCodeAt(frameOffset + 1);
+    let sampleL = (hiL << 8) | loL;
+    if (sampleL >= 0x8000) sampleL -= 0x10000;
+    left[i] = sampleL / 32768;
+
+    const loR = binary.charCodeAt(frameOffset + 2);
+    const hiR = binary.charCodeAt(frameOffset + 3);
+    let sampleR = (hiR << 8) | loR;
+    if (sampleR >= 0x8000) sampleR -= 0x10000;
+    right[i] = sampleR / 32768;
+  }
+
+  const buffer = audioContext.createBuffer(OUTPUT_CHANNELS, sampleCount, event.sampleRate || OUTPUT_SAMPLE_RATE);
+  buffer.copyToChannel(left, 0);
+  buffer.copyToChannel(right, 1);
+  return buffer;
+};
+
 export const App = () => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoContainerRef = useRef<HTMLDivElement | null>(null);
+  const isPreviewHoveredRef = useRef(false);
+
   const audioContextRef = useRef<AudioContext | null>(null);
-  const audioNodesRef = useRef<Map<number, AudioNodeState>>(new Map());
+  const trackAudioRef = useRef<Map<number, TrackAudioRuntime>>(new Map());
 
   const [status, setStatus] = useState<AppStatus>("Ready");
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -63,31 +120,128 @@ export const App = () => {
   const [detailsOpen, setDetailsOpen] = useState(false);
 
   const enabledTracks = useMemo(
-    () => tracks.filter((track) => track.enabled && track.outputPath),
+    () => tracks.filter((track) => track.enabled),
     [tracks]
   );
-
-  const ensureAudioContext = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext();
-    }
-    return audioContextRef.current;
-  };
-
-  const resetAudioGraph = useCallback(() => {
-    audioNodesRef.current.forEach((node) => {
-      node.element.pause();
-      node.source.disconnect();
-      node.gain.disconnect();
-    });
-    audioNodesRef.current.clear();
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
-  }, []);
 
   const log = useCallback((message: string) => {
     setLogs((prev) => [...prev, `${new Date().toLocaleTimeString()} ${message}`]);
   }, []);
+
+  const ensureAudioContext = useCallback(() => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
+    }
+    return audioContextRef.current;
+  }, []);
+
+  const clearTrackRuntime = useCallback((audioIndex: number) => {
+    const runtime = trackAudioRef.current.get(audioIndex);
+    if (!runtime) {
+      return;
+    }
+    runtime.scheduledSources.forEach((source) => {
+      try {
+        source.stop();
+      } catch {
+        // ignore stopped nodes
+      }
+      source.disconnect();
+    });
+    runtime.scheduledSources.clear();
+    runtime.gain.disconnect();
+    trackAudioRef.current.delete(audioIndex);
+  }, []);
+
+  const clearAllRuntime = useCallback(() => {
+    trackAudioRef.current.forEach((_value, audioIndex) => {
+      clearTrackRuntime(audioIndex);
+    });
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+  }, [clearTrackRuntime]);
+
+  const ensureTrackRuntime = useCallback((audioIndex: number) => {
+    const audioContext = ensureAudioContext();
+    const existing = trackAudioRef.current.get(audioIndex);
+    if (existing) {
+      return existing;
+    }
+
+    const gain = audioContext.createGain();
+    gain.connect(audioContext.destination);
+
+    const runtime: TrackAudioRuntime = {
+      gain,
+      nextStartAtSec: audioContext.currentTime + START_SAFETY_SEC,
+      scheduledSources: new Set()
+    };
+
+    trackAudioRef.current.set(audioIndex, runtime);
+    return runtime;
+  }, [ensureAudioContext]);
+
+  const applyGainState = useCallback((audioIndex: number, volume: number, muted: boolean) => {
+    const runtime = trackAudioRef.current.get(audioIndex);
+    if (!runtime) {
+      return;
+    }
+    runtime.gain.gain.value = muted ? 0 : volume / 100;
+  }, []);
+
+  const stopTrackDecoder = useCallback(async (audioIndex: number, reason: string) => {
+    await window.api.stopLiveDecode({ audioIndex });
+    clearTrackRuntime(audioIndex);
+    log(`[renderer] track ${audioIndex} decoder stopped (${reason})`);
+  }, [clearTrackRuntime, log]);
+
+  const startTrackDecoder = useCallback(async (audioIndex: number, startTimeSec: number) => {
+    if (!filePath) {
+      return;
+    }
+
+    const clampedRate = playbackRate === 1 ? 1 : 1;
+    if (playbackRate !== 1) {
+      log(`[renderer] track ${audioIndex}: live audio currently forced to 1x.`);
+    }
+
+    const audioContext = ensureAudioContext();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const runtime = ensureTrackRuntime(audioIndex);
+    runtime.nextStartAtSec = audioContext.currentTime + START_SAFETY_SEC;
+
+    await window.api.startLiveDecode({
+      filePath,
+      audioIndex,
+      startTimeSec,
+      playbackRate: clampedRate
+    });
+
+    log(`[renderer] track ${audioIndex} decoder started at ${startTimeSec.toFixed(3)}s`);
+  }, [ensureAudioContext, ensureTrackRuntime, filePath, log, playbackRate]);
+
+  const restartEnabledDecoders = useCallback(async (startTimeSec: number, reason: string) => {
+    const enabled = tracks.filter((track) => track.enabled);
+    await window.api.stopAllLiveDecodes();
+    enabled.forEach((track) => clearTrackRuntime(track.info.audioIndex));
+    if (!isPlaying) {
+      log(`[renderer] decoder restart skipped (${reason}) while paused.`);
+      return;
+    }
+
+    for (const track of enabled) {
+      await startTrackDecoder(track.info.audioIndex, startTimeSec);
+      applyGainState(track.info.audioIndex, track.volume, track.muted);
+    }
+
+    if (enabled.length > 0) {
+      setStatus("Streaming");
+      log(`[renderer] restarted ${enabled.length} decoder(s) from ${startTimeSec.toFixed(3)}s (${reason})`);
+    }
+  }, [applyGainState, clearTrackRuntime, isPlaying, log, startTrackDecoder, tracks]);
 
   const handleOpenFile = async () => {
     const selected = await window.api.openFile();
@@ -100,10 +254,11 @@ export const App = () => {
     setProbeResult(null);
     setTracks([]);
     setLogs([]);
-    resetAudioGraph();
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
+    await window.api.stopAllLiveDecodes();
+    clearAllRuntime();
 
     try {
       setFileUrl(window.api.toFileUrl(selected));
@@ -115,9 +270,7 @@ export const App = () => {
           info: track,
           enabled: false,
           muted: false,
-          volume: 100,
-          extracting: false,
-          progress: 0
+          volume: 100
         }))
       );
       setStatus("Ready");
@@ -133,106 +286,39 @@ export const App = () => {
   };
 
   const handleEnableTrack = async (audioIndex: number, enabled: boolean) => {
-    setTracks((prev) =>
-      prev.map((track) =>
-        track.info.audioIndex === audioIndex
-          ? { ...track, enabled, error: undefined }
-          : track
-      )
-    );
-
-    if (!enabled) {
-      const node = audioNodesRef.current.get(audioIndex);
-      if (node) {
-        node.element.pause();
-      }
+    const video = videoRef.current;
+    const track = tracks.find((item) => item.info.audioIndex === audioIndex);
+    if (!track) {
       return;
     }
 
-    const target = tracks.find((track) => track.info.audioIndex === audioIndex);
-    if (!target || !filePath) return;
+    setTracks((prev) => prev.map((item) => (
+      item.info.audioIndex === audioIndex
+        ? { ...item, enabled, error: undefined }
+        : item
+    )));
 
-    let outputPath = target.outputPath;
-    if (!outputPath) {
-      setTracks((prev) =>
-        prev.map((track) =>
-          track.info.audioIndex === audioIndex
-            ? { ...track, extracting: true, progress: 0 }
-            : track
-        )
-      );
-      setStatus("Extracting");
-      try {
-        const response: ExtractTrackResponse = await window.api.extractTrack({
-          filePath,
-          audioIndex,
-          duration: probeResult?.duration
-        });
-        outputPath = response.outputPath;
-        setTracks((prev) =>
-          prev.map((track) =>
-            track.info.audioIndex === audioIndex
-              ? {
-                  ...track,
-                  extracting: false,
-                  progress: 1,
-                  outputPath
-                }
-              : track
-          )
-        );
-        setStatus("Ready");
-      } catch (error) {
-        setTracks((prev) =>
-          prev.map((track) =>
-            track.info.audioIndex === audioIndex
-              ? {
-                  ...track,
-                  extracting: false,
-                  error: (error as Error).message
-                }
-              : track
-          )
-        );
-        setStatus("Error");
-        return;
-      }
+    if (!enabled) {
+      await stopTrackDecoder(audioIndex, "track disabled");
+      setStatus(tracks.some((item) => item.enabled && item.info.audioIndex !== audioIndex) ? "Streaming" : "Ready");
+      return;
     }
 
-    if (!outputPath) return;
-
-    const audioContext = ensureAudioContext();
-    const existing = audioNodesRef.current.get(audioIndex);
-    if (!existing) {
-      let outputUrl: string;
-      try {
-        outputUrl = window.api.toFileUrl(outputPath);
-      } catch (error) {
-        setTracks((prev) =>
-          prev.map((track) =>
-            track.info.audioIndex === audioIndex
-              ? { ...track, error: `Audio URL failed: ${(error as Error).message}` }
-              : track
-          )
-        );
-        setStatus("Error");
-        return;
+    try {
+      await startTrackDecoder(audioIndex, video?.currentTime ?? 0);
+      applyGainState(audioIndex, track.volume, track.muted);
+      if (isPlaying) {
+        setStatus("Streaming");
       }
-
-      const audioElement = new Audio(outputUrl);
-      audioElement.crossOrigin = "anonymous";
-      audioElement.preload = "auto";
-      audioElement.loop = false;
-      audioElement.playbackRate = playbackRate;
-      const source = audioContext.createMediaElementSource(audioElement);
-      const gain = audioContext.createGain();
-      source.connect(gain).connect(audioContext.destination);
-      audioNodesRef.current.set(audioIndex, { element: audioElement, source, gain });
-    }
-
-    if (isPlaying) {
-      syncAllAudioToVideo();
-      await playAllEnabled();
+    } catch (error) {
+      const message = (error as Error).message;
+      setTracks((prev) => prev.map((item) => (
+        item.info.audioIndex === audioIndex
+          ? { ...item, enabled: false, error: message }
+          : item
+      )));
+      setStatus("Error");
+      setLastError(message);
     }
   };
 
@@ -242,127 +328,112 @@ export const App = () => {
         track.info.audioIndex === audioIndex ? { ...track, volume } : track
       )
     );
-    const node = audioNodesRef.current.get(audioIndex);
-    if (node) {
-      node.gain.gain.value = volume / 100;
-    }
+    const currentTrack = tracks.find((track) => track.info.audioIndex === audioIndex);
+    applyGainState(audioIndex, volume, currentTrack?.muted ?? false);
   };
 
   const toggleMute = (audioIndex: number) => {
+    const current = tracks.find((track) => track.info.audioIndex === audioIndex);
+    const nextMuted = !(current?.muted ?? false);
+
     setTracks((prev) =>
       prev.map((track) =>
         track.info.audioIndex === audioIndex
-          ? { ...track, muted: !track.muted }
+          ? { ...track, muted: nextMuted }
           : track
       )
     );
-    const node = audioNodesRef.current.get(audioIndex);
-    const track = tracks.find((item) => item.info.audioIndex === audioIndex);
-    if (node && track) {
-      const nextMuted = !track.muted;
-      node.gain.gain.value = nextMuted ? 0 : track.volume / 100;
+
+    if (current) {
+      applyGainState(audioIndex, current.volume, nextMuted);
     }
-  };
-
-  const syncAllAudioToVideo = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    enabledTracks.forEach((track) => {
-      const node = audioNodesRef.current.get(track.info.audioIndex);
-      if (node) {
-        node.element.currentTime = video.currentTime;
-      }
-    });
-  };
-
-  const playAllEnabled = async () => {
-    const video = videoRef.current;
-    if (!video) return;
-    const nodes = enabledTracks
-      .map((track) => audioNodesRef.current.get(track.info.audioIndex))
-      .filter(Boolean) as AudioNodeState[];
-    for (const node of nodes) {
-      node.element.playbackRate = playbackRate;
-      await node.element.play();
-    }
-  };
-
-  const pauseAllEnabled = () => {
-    enabledTracks.forEach((track) => {
-      const node = audioNodesRef.current.get(track.info.audioIndex);
-      if (node) {
-        node.element.pause();
-      }
-    });
   };
 
   const togglePlay = async () => {
     const video = videoRef.current;
     if (!video) return;
+
     if (video.paused) {
       await video.play();
-      syncAllAudioToVideo();
-      await playAllEnabled();
       setIsPlaying(true);
+      await restartEnabledDecoders(video.currentTime, "play");
     } else {
       video.pause();
-      pauseAllEnabled();
       setIsPlaying(false);
+      await window.api.stopAllLiveDecodes();
+      enabledTracks.forEach((track) => clearTrackRuntime(track.info.audioIndex));
+      setStatus("Ready");
+      log("[renderer] paused and stopped all decoders.");
     }
   };
 
   const seekTo = async (time: number) => {
     const video = videoRef.current;
     if (!video) return;
-    pauseAllEnabled();
+
     video.currentTime = time;
-    syncAllAudioToVideo();
-    if (isPlaying) {
-      await playAllEnabled();
-    }
+    setCurrentTime(time);
+    await restartEnabledDecoders(time, "seek");
   };
 
   useEffect(() => {
     const disposeLog = window.api.onLog((event) => {
       log(`${event.level.toUpperCase()}: ${event.message}`);
     });
-    const disposeProgress = window.api.onExtractProgress(
-      (event: ExtractProgressEvent) => {
-        setTracks((prev) =>
-          prev.map((track) =>
-            track.info.audioIndex === event.audioIndex
-              ? { ...track, progress: event.progress }
-              : track
-          )
-        );
+
+    const disposeDecoderStatus = window.api.onDecoderStatus((event) => {
+      const message = `[decoder:${event.audioIndex}] ${event.message}`;
+      log(message);
+      if (event.level === "error") {
+        setTracks((prev) => prev.map((track) => (
+          track.info.audioIndex === event.audioIndex
+            ? { ...track, enabled: false, error: event.message }
+            : track
+        )));
       }
-    );
+    });
+
+    const disposeDecoderPcm = window.api.onDecoderPcm((event) => {
+      const audioContext = audioContextRef.current;
+      if (!audioContext) {
+        return;
+      }
+
+      const runtime = trackAudioRef.current.get(event.audioIndex);
+      if (!runtime) {
+        return;
+      }
+
+      const queueDepth = runtime.nextStartAtSec - audioContext.currentTime;
+      if (queueDepth > MAX_QUEUE_SEC) {
+        runtime.nextStartAtSec = audioContext.currentTime + START_SAFETY_SEC;
+      }
+
+      const buffer = decodePcmBase64ToAudioBuffer(audioContext, event);
+      if (!buffer) {
+        return;
+      }
+
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(runtime.gain);
+
+      const startAt = Math.max(audioContext.currentTime + START_SAFETY_SEC, runtime.nextStartAtSec);
+      runtime.nextStartAtSec = startAt + buffer.duration;
+      runtime.scheduledSources.add(source);
+      source.onended = () => {
+        source.disconnect();
+        runtime.scheduledSources.delete(source);
+      };
+      source.start(startAt);
+    });
+
     return () => {
       disposeLog();
-      disposeProgress();
+      disposeDecoderStatus();
+      disposeDecoderPcm();
     };
   }, [log]);
-
-  useEffect(() => {
-    enabledTracks.forEach((track) => {
-      const node = audioNodesRef.current.get(track.info.audioIndex);
-      if (node) {
-        node.gain.gain.value = track.muted ? 0 : track.volume / 100;
-      }
-    });
-  }, [enabledTracks]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.playbackRate = playbackRate;
-    enabledTracks.forEach((track) => {
-      const node = audioNodesRef.current.get(track.info.audioIndex);
-      if (node) {
-        node.element.playbackRate = playbackRate;
-      }
-    });
-  }, [playbackRate, enabledTracks]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -385,37 +456,47 @@ export const App = () => {
   }, [fileUrl]);
 
   useEffect(() => {
-    if (!isPlaying) return;
-    const interval = window.setInterval(() => {
-      const video = videoRef.current;
-      if (!video) return;
-      enabledTracks.forEach((track) => {
-        const node = audioNodesRef.current.get(track.info.audioIndex);
-        if (!node) return;
-        const drift = node.element.currentTime - video.currentTime;
-        const abs = Math.abs(drift);
-        if (abs > 0.25) {
-          node.element.currentTime = video.currentTime;
-          node.element.playbackRate = playbackRate;
-          return;
-        }
-        if (abs > 0.08) {
-          const correction = drift > 0 ? 0.97 : 1.03;
-          node.element.playbackRate = playbackRate * correction;
-        } else {
-          node.element.playbackRate = playbackRate;
-        }
-      });
-    }, 250);
-    return () => window.clearInterval(interval);
-  }, [enabledTracks, isPlaying, playbackRate]);
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Enter") {
+        return;
+      }
+      if (!isPreviewHoveredRef.current) {
+        return;
+      }
+      if (isTypingTarget(event.target)) {
+        return;
+      }
+
+      const preview = videoContainerRef.current;
+      if (!preview) {
+        return;
+      }
+
+      event.preventDefault();
+      if (document.fullscreenElement === preview) {
+        void document.exitFullscreen();
+      } else if (!document.fullscreenElement) {
+        void preview.requestFullscreen();
+      }
+    };
+
+    window.addEventListener("keydown", handleGlobalKeyDown);
+    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.playbackRate = playbackRate;
+  }, [playbackRate]);
 
   useEffect(() => {
     return () => {
+      void window.api.stopAllLiveDecodes();
       window.api.cleanupTemp();
-      resetAudioGraph();
+      clearAllRuntime();
     };
-  }, [resetAudioGraph]);
+  }, [clearAllRuntime]);
 
   return (
     <div className="app">
@@ -449,7 +530,7 @@ export const App = () => {
                   type="checkbox"
                   checked={track.enabled}
                   onChange={(event) =>
-                    handleEnableTrack(track.info.audioIndex, event.target.checked)
+                    void handleEnableTrack(track.info.audioIndex, event.target.checked)
                   }
                 />
                 <span>{buildTrackLabel(track.info)}</span>
@@ -477,18 +558,22 @@ export const App = () => {
                 />
                 <span className="volume-value">{track.volume}%</span>
               </div>
-              {track.extracting && (
-                <div className="progress">
-                  Extracting... {Math.round(track.progress * 100)}%
-                </div>
-              )}
               {track.error && <div className="error">{track.error}</div>}
             </div>
           ))}
         </aside>
 
         <main className="player-panel">
-          <div className="video-container">
+          <div
+            className="video-container"
+            ref={videoContainerRef}
+            onMouseEnter={() => {
+              isPreviewHoveredRef.current = true;
+            }}
+            onMouseLeave={() => {
+              isPreviewHoveredRef.current = false;
+            }}
+          >
             {fileUrl ? (
               <video ref={videoRef} src={fileUrl} muted />
             ) : (
@@ -499,7 +584,7 @@ export const App = () => {
       </div>
 
       <footer className="bottom-bar">
-        <button className="primary" onClick={togglePlay} disabled={!fileUrl}>
+        <button className="primary" onClick={() => void togglePlay()} disabled={!fileUrl}>
           {isPlaying ? "Pause" : "Play"}
         </button>
         <div className="time-info">
@@ -512,7 +597,7 @@ export const App = () => {
           max={duration || 0}
           step={0.05}
           value={currentTime}
-          onChange={(event) => seekTo(Number(event.target.value))}
+          onChange={(event) => void seekTo(Number(event.target.value))}
           disabled={!fileUrl}
         />
         <label className="rate">

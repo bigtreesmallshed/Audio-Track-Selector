@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
-import { spawn } from "child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
 import { pathToFileURL } from "node:url";
@@ -13,11 +13,15 @@ import {
 } from "./portable";
 import type {
   AudioTrackInfo,
+  DecoderPcmEvent,
+  DecoderStatusEvent,
   ExtractProgressEvent,
   ExtractTrackRequest,
   ExtractTrackResponse,
   LogEvent,
-  ProbeResult
+  ProbeResult,
+  StartLiveDecodeRequest,
+  StopLiveDecodeRequest
 } from "./ipc-types";
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
@@ -27,10 +31,25 @@ let tempDir: string | null = null;
 const TEMP_DIR_PREFIX = "audio-track-selector-";
 const STALE_TEMP_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 2;
 const FFPROBE_TIMEOUT_MS = 30_000;
+const PCM_CHUNK_BYTES = 16_384;
+
+type DecoderSession = {
+  request: StartLiveDecodeRequest;
+  child: ChildProcessWithoutNullStreams;
+  stderr: string;
+};
+
+const liveDecoders = new Map<number, DecoderSession>();
 
 const logToRenderer = (event: LogEvent) => {
   if (mainWindow) {
     mainWindow.webContents.send("log", event);
+  }
+};
+
+const emitDecoderStatus = (event: DecoderStatusEvent) => {
+  if (mainWindow) {
+    mainWindow.webContents.send("decoder-status", event);
   }
 };
 
@@ -117,6 +136,129 @@ const checkBinaryReadable = async (binaryName: "ffmpeg" | "ffprobe", resolvedPat
       message: `${binaryName} executable was resolved to "${resolvedPath}" but is not readable. Lookup order: ${shortList}`
     });
   }
+};
+
+const stopLiveDecoder = (audioIndex: number, reason = "stop requested") => {
+  const active = liveDecoders.get(audioIndex);
+  if (!active) {
+    return;
+  }
+
+  logToRenderer({
+    level: "info",
+    message: `[decoder:${audioIndex}] stopping (${reason})`
+  });
+
+  active.child.stdout.removeAllListeners();
+  active.child.stderr.removeAllListeners();
+  active.child.removeAllListeners();
+  active.child.kill();
+  liveDecoders.delete(audioIndex);
+};
+
+const stopAllLiveDecoders = (reason: string) => {
+  [...liveDecoders.keys()].forEach((audioIndex) => {
+    stopLiveDecoder(audioIndex, reason);
+  });
+};
+
+const startLiveDecoder = (request: StartLiveDecodeRequest) => {
+  const ffmpegPath = resolveFfmpegPath();
+  const clampedStart = Math.max(request.startTimeSec, 0);
+  const playbackRate = request.playbackRate > 0 ? request.playbackRate : 1;
+
+  stopLiveDecoder(request.audioIndex, "restart requested");
+
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-re",
+    "-ss",
+    clampedStart.toFixed(3),
+    "-i",
+    request.filePath,
+    "-map",
+    `0:a:${request.audioIndex}`,
+    "-vn",
+    "-sn",
+    "-dn",
+    "-ac",
+    "2",
+    "-ar",
+    "48000",
+    "-f",
+    "s16le",
+    "pipe:1"
+  ];
+
+  logToRenderer({
+    level: "info",
+    message: `[decoder:${request.audioIndex}] start @${clampedStart.toFixed(3)}s rate=${playbackRate.toFixed(2)} args=${JSON.stringify(args)}`
+  });
+
+  const child = spawn(ffmpegPath, args, { windowsHide: true });
+  const session: DecoderSession = {
+    request: { ...request, startTimeSec: clampedStart, playbackRate },
+    child,
+    stderr: ""
+  };
+
+  liveDecoders.set(request.audioIndex, session);
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    const sessionCheck = liveDecoders.get(request.audioIndex);
+    if (!sessionCheck || sessionCheck.child.pid !== child.pid) {
+      return;
+    }
+
+    let offset = 0;
+    while (offset < chunk.length) {
+      const end = Math.min(offset + PCM_CHUNK_BYTES, chunk.length);
+      const pcmSlice = chunk.subarray(offset, end);
+      const payload: DecoderPcmEvent = {
+        audioIndex: request.audioIndex,
+        pcmBase64: pcmSlice.toString("base64"),
+        channels: 2,
+        sampleRate: 48000
+      };
+      mainWindow?.webContents.send("decoder-pcm", payload);
+      offset = end;
+    }
+  });
+
+  child.stderr.on("data", (data) => {
+    session.stderr += data.toString();
+  });
+
+  child.on("close", (code, signal) => {
+    const active = liveDecoders.get(request.audioIndex);
+    if (!active || active.child.pid !== child.pid) {
+      return;
+    }
+
+    liveDecoders.delete(request.audioIndex);
+
+    const message = `[decoder:${request.audioIndex}] closed code=${code ?? "null"} signal=${signal ?? "null"}`;
+    emitDecoderStatus({
+      audioIndex: request.audioIndex,
+      level: code === 0 ? "info" : "error",
+      message: code === 0 ? message : `${message} stderr=${session.stderr.trim() || "<empty>"}`
+    });
+  });
+
+  child.on("error", (error) => {
+    const active = liveDecoders.get(request.audioIndex);
+    if (!active || active.child.pid !== child.pid) {
+      return;
+    }
+    liveDecoders.delete(request.audioIndex);
+    emitDecoderStatus({
+      audioIndex: request.audioIndex,
+      level: "error",
+      message: formatBinaryError("ffmpeg", error)
+    });
+  });
 };
 
 const createWindow = () => {
@@ -437,6 +579,7 @@ app.on("ready", () => {
   ipcMain.handle("probe-file", async (_event, filePath: string) => {
     try {
       await cleanupTempDir();
+      stopAllLiveDecoders("file reprobe");
       const result = await runFfprobe(filePath);
       return result;
     } catch (error) {
@@ -461,12 +604,33 @@ app.on("ready", () => {
     }
   });
 
+  ipcMain.handle("start-live-decode", async (_event, request: StartLiveDecodeRequest) => {
+    try {
+      startLiveDecoder(request);
+    } catch (error) {
+      logToRenderer({
+        level: "error",
+        message: `start-live-decode failed for track ${request.audioIndex}: ${(error as Error).message}`
+      });
+      throw error;
+    }
+  });
+
+  ipcMain.handle("stop-live-decode", async (_event, request: StopLiveDecodeRequest) => {
+    stopLiveDecoder(request.audioIndex, "stop-live-decode");
+  });
+
+  ipcMain.handle("stop-all-live-decodes", async () => {
+    stopAllLiveDecoders("stop-all-live-decodes");
+  });
+
   ipcMain.handle("cleanup-temp", async () => {
     await cleanupTempDir();
   });
 });
 
 app.on("before-quit", async () => {
+  stopAllLiveDecoders("before-quit");
   await cleanupTempDir();
 });
 
