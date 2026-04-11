@@ -41,16 +41,32 @@ type DecoderSession = {
 
 const liveDecoders = new Map<number, DecoderSession>();
 
+let isShuttingDown = false;
+let shutdownPromise: Promise<void> | null = null;
+
+const sendToRenderer = (channel: string, payload: unknown) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return false;
+  }
+  if (mainWindow.webContents.isDestroyed()) {
+    return false;
+  }
+  try {
+    mainWindow.webContents.send(channel, payload);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const logToRenderer = (event: LogEvent) => {
-  if (mainWindow) {
-    mainWindow.webContents.send("log", event);
+  if (!sendToRenderer("log", event)) {
+    console[event.level === "error" ? "error" : "info"](`[renderer-log-fallback] ${event.message}`);
   }
 };
 
 const emitDecoderStatus = (event: DecoderStatusEvent) => {
-  if (mainWindow) {
-    mainWindow.webContents.send("decoder-status", event);
-  }
+  sendToRenderer("decoder-status", event);
 };
 
 const ensureTempDir = async () => {
@@ -222,7 +238,7 @@ const startLiveDecoder = (request: StartLiveDecodeRequest) => {
         channels: 2,
         sampleRate: 48000
       };
-      mainWindow?.webContents.send("decoder-pcm", payload);
+      sendToRenderer("decoder-pcm", payload);
       offset = end;
     }
   });
@@ -270,6 +286,10 @@ const createWindow = () => {
       contextIsolation: true,
       nodeIntegration: false
     }
+  });
+
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
 
   if (isDev) {
@@ -512,9 +532,7 @@ const runFfmpegExtraction = async (
             audioIndex: request.audioIndex,
             progress
           };
-          if (mainWindow) {
-            mainWindow.webContents.send("extract-progress", event);
-          }
+          sendToRenderer("extract-progress", event);
         }
       }
     });
@@ -534,6 +552,25 @@ const runFfmpegExtraction = async (
 
     child.on("error", (error) => reject(new Error(formatBinaryError("ffmpeg", error))));
   });
+};
+
+
+const teardownApp = async (reason: string) => {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+
+  isShuttingDown = true;
+  shutdownPromise = (async () => {
+    stopAllLiveDecoders(reason);
+    await cleanupTempDir();
+  })();
+
+  try {
+    await shutdownPromise;
+  } finally {
+    shutdownPromise = null;
+  }
 };
 
 initializePortablePaths();
@@ -577,6 +614,9 @@ app.on("ready", () => {
   });
 
   ipcMain.handle("probe-file", async (_event, filePath: string) => {
+    if (isShuttingDown) {
+      throw new Error("App is shutting down");
+    }
     try {
       await cleanupTempDir();
       stopAllLiveDecoders("file reprobe");
@@ -605,6 +645,9 @@ app.on("ready", () => {
   });
 
   ipcMain.handle("start-live-decode", async (_event, request: StartLiveDecodeRequest) => {
+    if (isShuttingDown) {
+      return;
+    }
     try {
       startLiveDecoder(request);
     } catch (error) {
@@ -629,12 +672,12 @@ app.on("ready", () => {
   });
 });
 
-app.on("before-quit", async () => {
-  stopAllLiveDecoders("before-quit");
-  await cleanupTempDir();
+app.on("before-quit", () => {
+  void teardownApp("before-quit");
 });
 
 app.on("window-all-closed", () => {
+  void teardownApp("window-all-closed");
   if (process.platform !== "darwin") {
     app.quit();
   }
