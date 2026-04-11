@@ -1,4 +1,4 @@
-export type AppStatus = "Ready" | "Probing" | "Extracting" | "Error";
+export type AppStatus = "Ready" | "Probing" | "Streaming" | "Error";
 
 export interface AudioTrackInfo {
   audioIndex: number;
@@ -32,6 +32,30 @@ export interface ExtractTrackResponse {
 export interface ExtractProgressEvent {
   audioIndex: number;
   progress: number;
+}
+
+export interface StartLiveDecodeRequest {
+  filePath: string;
+  audioIndex: number;
+  startTimeSec: number;
+  playbackRate: number;
+}
+
+export interface StopLiveDecodeRequest {
+  audioIndex: number;
+}
+
+export interface DecoderPcmEvent {
+  audioIndex: number;
+  pcmBase64: string;
+  channels: number;
+  sampleRate: number;
+}
+
+export interface DecoderStatusEvent {
+  audioIndex: number;
+  level: "info" | "error";
+  message: string;
 }
 
 export interface LogEvent {

@@ -1,11 +1,15 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
 import type {
+  DecoderPcmEvent,
+  DecoderStatusEvent,
   ExtractProgressEvent,
   ExtractTrackRequest,
   ExtractTrackResponse,
   LogEvent,
-  ProbeResult
+  ProbeResult,
+  StartLiveDecodeRequest,
+  StopLiveDecodeRequest
 } from "./ipc-types";
 
 const encodePathSegment = (segment: string) => encodeURIComponent(segment);
@@ -57,12 +61,29 @@ const api = {
     ipcRenderer.invoke("probe-file", filePath),
   extractTrack: (request: ExtractTrackRequest): Promise<ExtractTrackResponse> =>
     ipcRenderer.invoke("extract-track", request),
+  startLiveDecode: (request: StartLiveDecodeRequest): Promise<void> =>
+    ipcRenderer.invoke("start-live-decode", request),
+  stopLiveDecode: (request: StopLiveDecodeRequest): Promise<void> =>
+    ipcRenderer.invoke("stop-live-decode", request),
+  stopAllLiveDecodes: (): Promise<void> => ipcRenderer.invoke("stop-all-live-decodes"),
   cleanupTemp: (): Promise<void> => ipcRenderer.invoke("cleanup-temp"),
   onExtractProgress: (callback: (event: ExtractProgressEvent) => void) => {
     const listener = (_event: IpcRendererEvent, data: ExtractProgressEvent) =>
       callback(data);
     ipcRenderer.on("extract-progress", listener);
     return () => ipcRenderer.removeListener("extract-progress", listener);
+  },
+  onDecoderPcm: (callback: (event: DecoderPcmEvent) => void) => {
+    const listener = (_event: IpcRendererEvent, data: DecoderPcmEvent) =>
+      callback(data);
+    ipcRenderer.on("decoder-pcm", listener);
+    return () => ipcRenderer.removeListener("decoder-pcm", listener);
+  },
+  onDecoderStatus: (callback: (event: DecoderStatusEvent) => void) => {
+    const listener = (_event: IpcRendererEvent, data: DecoderStatusEvent) =>
+      callback(data);
+    ipcRenderer.on("decoder-status", listener);
+    return () => ipcRenderer.removeListener("decoder-status", listener);
   },
   onLog: (callback: (event: LogEvent) => void) => {
     const listener = (_event: IpcRendererEvent, data: LogEvent) =>

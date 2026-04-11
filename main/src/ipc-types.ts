@@ -32,6 +32,30 @@ export interface ExtractProgressEvent {
   progress: number;
 }
 
+export interface StartLiveDecodeRequest {
+  filePath: string;
+  audioIndex: number;
+  startTimeSec: number;
+  playbackRate: number;
+}
+
+export interface StopLiveDecodeRequest {
+  audioIndex: number;
+}
+
+export interface DecoderPcmEvent {
+  audioIndex: number;
+  pcmBase64: string;
+  channels: number;
+  sampleRate: number;
+}
+
+export interface DecoderStatusEvent {
+  audioIndex: number;
+  level: "info" | "error";
+  message: string;
+}
+
 export interface LogEvent {
   level: "info" | "error";
   message: string;
