@@ -9,7 +9,6 @@ import type {
 
 type TrackState = {
   info: AudioTrackInfo;
-  enabled: boolean;
   muted: boolean;
   volume: number;
   error?: string;
@@ -25,11 +24,24 @@ const OUTPUT_SAMPLE_RATE = 48000;
 const OUTPUT_CHANNELS = 2;
 const START_SAFETY_SEC = 0.06;
 const MAX_QUEUE_SEC = 0.75;
+const DB_UPDATE_INTERVAL_MS = 2000;
 
 const formatTime = (value: number) => {
-  const minutes = Math.floor(value / 60);
-  const seconds = Math.floor(value % 60);
+  const safeValue = Number.isFinite(value) ? Math.max(0, value) : 0;
+  const hours = Math.floor(safeValue / 3600);
+  const minutes = Math.floor((safeValue % 3600) / 60);
+  const seconds = Math.floor(safeValue % 60);
+  if (hours >= 1) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  }
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+};
+
+const volumeToDb = (volume: number, muted: boolean) => {
+  if (muted || volume <= 0) {
+    return null;
+  }
+  return 20 * Math.log10(volume / 100);
 };
 
 const buildTrackLabel = (track: AudioTrackInfo) => {
@@ -105,12 +117,18 @@ export const App = () => {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const trackAudioRef = useRef<Map<number, TrackAudioRuntime>>(new Map());
+  const tracksRef = useRef<TrackState[]>([]);
+  const isPlayingRef = useRef(false);
+  const seekRequestRef = useRef<{ id: number; time: number } | null>(null);
+  const seekCounterRef = useRef(0);
+  const seekLoopActiveRef = useRef(false);
 
   const [status, setStatus] = useState<AppStatus>("Ready");
   const [filePath, setFilePath] = useState<string | null>(null);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [tracks, setTracks] = useState<TrackState[]>([]);
+  const [dbAverages, setDbAverages] = useState<Record<number, number | null>>({});
   const [logs, setLogs] = useState<string[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
   const [playbackRate, setPlaybackRate] = useState(1);
@@ -118,9 +136,19 @@ export const App = () => {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [isPreviewFullscreen, setIsPreviewFullscreen] = useState(false);
+  const [limiterOpen, setLimiterOpen] = useState(false);
 
-  const enabledTracks = useMemo(
-    () => tracks.filter((track) => track.enabled),
+  useEffect(() => {
+    tracksRef.current = tracks;
+  }, [tracks]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  const audibleTracks = useMemo(
+    () => tracks.filter((track) => !track.muted),
     [tracks]
   );
 
@@ -195,8 +223,8 @@ export const App = () => {
     log(`[renderer] track ${audioIndex} decoder stopped (${reason})`);
   }, [clearTrackRuntime, log]);
 
-  const startTrackDecoder = useCallback(async (audioIndex: number, startTimeSec: number) => {
-    if (!filePath) {
+  const startTrackDecoder = useCallback(async (audioIndex: number, startTimeSec: number, muted: boolean, volume: number) => {
+    if (!filePath || muted) {
       return;
     }
 
@@ -220,28 +248,48 @@ export const App = () => {
       playbackRate: clampedRate
     });
 
+    applyGainState(audioIndex, volume, muted);
     log(`[renderer] track ${audioIndex} decoder started at ${startTimeSec.toFixed(3)}s`);
-  }, [ensureAudioContext, ensureTrackRuntime, filePath, log, playbackRate]);
+  }, [applyGainState, ensureAudioContext, ensureTrackRuntime, filePath, log, playbackRate]);
 
-  const restartEnabledDecoders = useCallback(async (startTimeSec: number, reason: string) => {
-    const enabled = tracks.filter((track) => track.enabled);
+  const restartAudibleDecoders = useCallback(async (startTimeSec: number, reason: string) => {
+    const currentTracks = tracksRef.current;
+    const audible = currentTracks.filter((track) => !track.muted);
     await window.api.stopAllLiveDecodes();
-    enabled.forEach((track) => clearTrackRuntime(track.info.audioIndex));
-    if (!isPlaying) {
+    audible.forEach((track) => clearTrackRuntime(track.info.audioIndex));
+
+    if (!isPlayingRef.current) {
       log(`[renderer] decoder restart skipped (${reason}) while paused.`);
       return;
     }
 
-    for (const track of enabled) {
-      await startTrackDecoder(track.info.audioIndex, startTimeSec);
-      applyGainState(track.info.audioIndex, track.volume, track.muted);
+    for (const track of audible) {
+      await startTrackDecoder(track.info.audioIndex, startTimeSec, track.muted, track.volume);
     }
 
-    if (enabled.length > 0) {
+    if (audible.length > 0) {
       setStatus("Streaming");
-      log(`[renderer] restarted ${enabled.length} decoder(s) from ${startTimeSec.toFixed(3)}s (${reason})`);
+      log(`[renderer] restarted ${audible.length} decoder(s) from ${startTimeSec.toFixed(3)}s (${reason})`);
+    } else {
+      setStatus("Ready");
     }
-  }, [applyGainState, clearTrackRuntime, isPlaying, log, startTrackDecoder, tracks]);
+  }, [clearTrackRuntime, log, startTrackDecoder]);
+
+  const processPendingSeeks = useCallback(async () => {
+    if (seekLoopActiveRef.current) {
+      return;
+    }
+    seekLoopActiveRef.current = true;
+    try {
+      while (seekRequestRef.current && isPlayingRef.current) {
+        const request = seekRequestRef.current;
+        seekRequestRef.current = null;
+        await restartAudibleDecoders(request.time, `seek#${request.id}`);
+      }
+    } finally {
+      seekLoopActiveRef.current = false;
+    }
+  }, [restartAudibleDecoders]);
 
   const handleOpenFile = async () => {
     const selected = await window.api.openFile();
@@ -253,6 +301,7 @@ export const App = () => {
     setFileUrl(null);
     setProbeResult(null);
     setTracks([]);
+    setDbAverages({});
     setLogs([]);
     setIsPlaying(false);
     setCurrentTime(0);
@@ -268,8 +317,7 @@ export const App = () => {
       setTracks(
         result.audioTracks.map((track) => ({
           info: track,
-          enabled: false,
-          muted: false,
+          muted: true,
           volume: 100
         }))
       );
@@ -285,37 +333,40 @@ export const App = () => {
     }
   };
 
-  const handleEnableTrack = async (audioIndex: number, enabled: boolean) => {
-    const video = videoRef.current;
-    const track = tracks.find((item) => item.info.audioIndex === audioIndex);
-    if (!track) {
+  const setTrackMute = async (audioIndex: number, muted: boolean) => {
+    const current = tracksRef.current.find((track) => track.info.audioIndex === audioIndex);
+    if (!current) {
       return;
     }
 
-    setTracks((prev) => prev.map((item) => (
-      item.info.audioIndex === audioIndex
-        ? { ...item, enabled, error: undefined }
-        : item
-    )));
+    setTracks((prev) =>
+      prev.map((track) =>
+        track.info.audioIndex === audioIndex
+          ? { ...track, muted, error: undefined }
+          : track
+      )
+    );
 
-    if (!enabled) {
-      await stopTrackDecoder(audioIndex, "track disabled");
-      setStatus(tracks.some((item) => item.enabled && item.info.audioIndex !== audioIndex) ? "Streaming" : "Ready");
+    if (muted) {
+      await stopTrackDecoder(audioIndex, "muted");
+      setStatus(tracksRef.current.some((track) => !track.muted && track.info.audioIndex !== audioIndex) && isPlayingRef.current ? "Streaming" : "Ready");
+      return;
+    }
+
+    if (!isPlayingRef.current) {
       return;
     }
 
     try {
-      await startTrackDecoder(audioIndex, video?.currentTime ?? 0);
-      applyGainState(audioIndex, track.volume, track.muted);
-      if (isPlaying) {
-        setStatus("Streaming");
-      }
+      const video = videoRef.current;
+      await startTrackDecoder(audioIndex, video?.currentTime ?? currentTime, false, current.volume);
+      setStatus("Streaming");
     } catch (error) {
       const message = (error as Error).message;
-      setTracks((prev) => prev.map((item) => (
-        item.info.audioIndex === audioIndex
-          ? { ...item, enabled: false, error: message }
-          : item
+      setTracks((prev) => prev.map((track) => (
+        track.info.audioIndex === audioIndex
+          ? { ...track, muted: true, error: message }
+          : track
       )));
       setStatus("Error");
       setLastError(message);
@@ -328,25 +379,8 @@ export const App = () => {
         track.info.audioIndex === audioIndex ? { ...track, volume } : track
       )
     );
-    const currentTrack = tracks.find((track) => track.info.audioIndex === audioIndex);
-    applyGainState(audioIndex, volume, currentTrack?.muted ?? false);
-  };
-
-  const toggleMute = (audioIndex: number) => {
-    const current = tracks.find((track) => track.info.audioIndex === audioIndex);
-    const nextMuted = !(current?.muted ?? false);
-
-    setTracks((prev) =>
-      prev.map((track) =>
-        track.info.audioIndex === audioIndex
-          ? { ...track, muted: nextMuted }
-          : track
-      )
-    );
-
-    if (current) {
-      applyGainState(audioIndex, current.volume, nextMuted);
-    }
+    const currentTrack = tracksRef.current.find((track) => track.info.audioIndex === audioIndex);
+    applyGainState(audioIndex, volume, currentTrack?.muted ?? true);
   };
 
   const togglePlay = async () => {
@@ -356,25 +390,51 @@ export const App = () => {
     if (video.paused) {
       await video.play();
       setIsPlaying(true);
-      await restartEnabledDecoders(video.currentTime, "play");
+      await restartAudibleDecoders(video.currentTime, "play");
     } else {
       video.pause();
       setIsPlaying(false);
       await window.api.stopAllLiveDecodes();
-      enabledTracks.forEach((track) => clearTrackRuntime(track.info.audioIndex));
+      audibleTracks.forEach((track) => clearTrackRuntime(track.info.audioIndex));
       setStatus("Ready");
       log("[renderer] paused and stopped all decoders.");
     }
   };
 
-  const seekTo = async (time: number) => {
+  const seekTo = useCallback(async (time: number) => {
     const video = videoRef.current;
     if (!video) return;
 
-    video.currentTime = time;
-    setCurrentTime(time);
-    await restartEnabledDecoders(time, "seek");
-  };
+    const clamped = Math.max(0, Math.min(time, duration || Number.MAX_SAFE_INTEGER));
+    video.currentTime = clamped;
+    setCurrentTime(clamped);
+
+    const id = ++seekCounterRef.current;
+    seekRequestRef.current = { id, time: clamped };
+    await processPendingSeeks();
+  }, [duration, processPendingSeeks]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      const snapshot = tracksRef.current;
+      setDbAverages((prev) => {
+        const next = { ...prev };
+        for (const track of snapshot) {
+          const fresh = volumeToDb(track.volume, track.muted);
+          const previous = prev[track.info.audioIndex] ?? null;
+          next[track.info.audioIndex] =
+            fresh === null
+              ? null
+              : previous === null
+                ? fresh
+                : (previous * 0.7) + (fresh * 0.3);
+        }
+        return next;
+      });
+    }, DB_UPDATE_INTERVAL_MS);
+
+    return () => window.clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const disposeLog = window.api.onLog((event) => {
@@ -387,7 +447,7 @@ export const App = () => {
       if (event.level === "error") {
         setTracks((prev) => prev.map((track) => (
           track.info.audioIndex === event.audioIndex
-            ? { ...track, enabled: false, error: event.message }
+            ? { ...track, muted: true, error: event.message }
             : track
         )));
       }
@@ -457,32 +517,49 @@ export const App = () => {
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Enter") {
-        return;
-      }
-      if (!isPreviewHoveredRef.current) {
-        return;
-      }
       if (isTypingTarget(event.target)) {
         return;
       }
 
-      const preview = videoContainerRef.current;
-      if (!preview) {
+      if (event.key === "Enter" && isPreviewHoveredRef.current) {
+        const preview = videoContainerRef.current;
+        if (!preview) {
+          return;
+        }
+
+        event.preventDefault();
+        if (document.fullscreenElement === preview) {
+          void document.exitFullscreen();
+        } else if (!document.fullscreenElement) {
+          void preview.requestFullscreen();
+        }
         return;
       }
 
-      event.preventDefault();
-      if (document.fullscreenElement === preview) {
-        void document.exitFullscreen();
-      } else if (!document.fullscreenElement) {
-        void preview.requestFullscreen();
+      if (!fileUrl || !videoRef.current) {
+        return;
+      }
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        void seekTo(videoRef.current.currentTime - 10);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        void seekTo(videoRef.current.currentTime + 10);
       }
     };
 
+    const handleFullscreenChange = () => {
+      setIsPreviewFullscreen(document.fullscreenElement === videoContainerRef.current);
+    };
+
     window.addEventListener("keydown", handleGlobalKeyDown);
-    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, []);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeyDown);
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, [fileUrl, seekTo]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -523,49 +600,57 @@ export const App = () => {
           {tracks.length === 0 && (
             <p className="empty">Open a video to see audio tracks.</p>
           )}
-          {tracks.map((track) => (
-            <div key={track.info.audioIndex} className="track-row">
-              <label className="track-toggle">
-                <input
-                  type="checkbox"
-                  checked={track.enabled}
-                  onChange={(event) =>
-                    void handleEnableTrack(track.info.audioIndex, event.target.checked)
-                  }
-                />
-                <span>{buildTrackLabel(track.info)}</span>
-              </label>
-              <div className="track-controls">
-                <button
-                  className={track.muted ? "muted" : ""}
-                  onClick={() => toggleMute(track.info.audioIndex)}
-                  disabled={!track.enabled}
-                >
-                  {track.muted ? "Muted" : "Mute"}
-                </button>
-                <input
-                  type="range"
-                  min={0}
-                  max={200}
-                  value={track.volume}
-                  onChange={(event) =>
-                    updateTrackVolume(
-                      track.info.audioIndex,
-                      Number(event.target.value)
-                    )
-                  }
-                  disabled={!track.enabled}
-                />
-                <span className="volume-value">{track.volume}%</span>
+          {tracks.map((track) => {
+            const db = dbAverages[track.info.audioIndex];
+            return (
+              <div key={track.info.audioIndex} className="track-row">
+                <div className="track-label">{buildTrackLabel(track.info)}</div>
+                <div className="track-controls">
+                  <button
+                    className={track.muted ? "" : "unmuted"}
+                    onClick={() => void setTrackMute(track.info.audioIndex, !track.muted)}
+                  >
+                    {track.muted ? "Unmute" : "Mute"}
+                  </button>
+                  <input
+                    type="range"
+                    min={0}
+                    max={200}
+                    value={track.volume}
+                    onChange={(event) =>
+                      updateTrackVolume(
+                        track.info.audioIndex,
+                        Number(event.target.value)
+                      )
+                    }
+                  />
+                  <span className="volume-value">{track.volume}%</span>
+                  <span className="db-box">{db === null || db === undefined ? "-∞ dB" : `${db.toFixed(1)} dB`}</span>
+                </div>
+                {track.error && <div className="error">{track.error}</div>}
               </div>
-              {track.error && <div className="error">{track.error}</div>}
-            </div>
-          ))}
+            );
+          })}
+
+          <section className="limiter-panel">
+            <button className="details-toggle" onClick={() => setLimiterOpen((prev) => !prev)}>
+              {limiterOpen ? "Hide Advanced Limiter" : "Show Advanced Limiter"}
+            </button>
+            {limiterOpen && (
+              <div className="limiter-body">
+                <div>Master limiter (scaffold only, not wired into output bus in Rev 0.2.1).</div>
+                <label>
+                  Threshold
+                  <input type="range" min={-24} max={0} defaultValue={-6} disabled />
+                </label>
+              </div>
+            )}
+          </section>
         </aside>
 
         <main className="player-panel">
           <div
-            className="video-container"
+            className={`video-container ${isPreviewFullscreen ? "preview-fullscreen" : ""}`}
             ref={videoContainerRef}
             onMouseEnter={() => {
               isPreviewHoveredRef.current = true;
@@ -584,44 +669,49 @@ export const App = () => {
       </div>
 
       <footer className="bottom-bar">
-        <button className="primary" onClick={() => void togglePlay()} disabled={!fileUrl}>
-          {isPlaying ? "Pause" : "Play"}
-        </button>
-        <div className="time-info">
-          {formatTime(currentTime)} / {formatTime(duration || 0)}
-        </div>
-        <input
-          className="scrubber"
-          type="range"
-          min={0}
-          max={duration || 0}
-          step={0.05}
-          value={currentTime}
-          onChange={(event) => void seekTo(Number(event.target.value))}
-          disabled={!fileUrl}
-        />
-        <label className="rate">
-          Speed
-          <select
-            value={playbackRate}
-            onChange={(event) => setPlaybackRate(Number(event.target.value))}
+        <div className="transport-row">
+          <button className="primary" onClick={() => void togglePlay()} disabled={!fileUrl}>
+            {isPlaying ? "Pause" : "Play"}
+          </button>
+          <label className="rate">
+            Speed
+            <select
+              value={playbackRate}
+              onChange={(event) => setPlaybackRate(Number(event.target.value))}
+            >
+              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
+                <option key={rate} value={rate}>
+                  {rate}x
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="details-toggle"
+            onClick={() => setDetailsOpen((prev) => !prev)}
           >
-            {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
-              <option key={rate} value={rate}>
-                {rate}x
-              </option>
-            ))}
-          </select>
-        </label>
+            {detailsOpen ? "Hide Details" : "Show Details"}
+          </button>
+        </div>
+
+        <div className="seek-row">
+          <div className="time-info">
+            {formatTime(currentTime)} / {formatTime(duration || 0)}
+          </div>
+          <input
+            className="scrubber"
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.05}
+            value={currentTime}
+            onChange={(event) => void seekTo(Number(event.target.value))}
+            disabled={!fileUrl}
+          />
+        </div>
       </footer>
 
       <section className="details">
-        <button
-          className="details-toggle"
-          onClick={() => setDetailsOpen((prev) => !prev)}
-        >
-          {detailsOpen ? "Hide Details" : "Show Details"}
-        </button>
         {detailsOpen && (
           <div className="details-panel">
             <h3>Technical Details</h3>
