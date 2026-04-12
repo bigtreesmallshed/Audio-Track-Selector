@@ -25,6 +25,7 @@ const OUTPUT_CHANNELS = 2;
 const START_SAFETY_SEC = 0.06;
 const MAX_QUEUE_SEC = 0.75;
 const DB_UPDATE_INTERVAL_MS = 2000;
+const MIN_METER_DB = -60;
 
 const formatTime = (value: number) => {
   const safeValue = Number.isFinite(value) ? Math.max(0, value) : 0;
@@ -138,6 +139,7 @@ export const App = () => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [isPreviewFullscreen, setIsPreviewFullscreen] = useState(false);
   const [limiterOpen, setLimiterOpen] = useState(false);
+  const [expandedMeters, setExpandedMeters] = useState<Record<number, boolean>>({});
 
   useEffect(() => {
     tracksRef.current = tracks;
@@ -302,6 +304,7 @@ export const App = () => {
     setProbeResult(null);
     setTracks([]);
     setDbAverages({});
+    setExpandedMeters({});
     setLogs([]);
     setIsPlaying(false);
     setCurrentTime(0);
@@ -540,7 +543,10 @@ export const App = () => {
         return;
       }
 
-      if (event.key === "ArrowLeft") {
+      if (event.key === " " || event.key === "Spacebar") {
+        event.preventDefault();
+        void togglePlay();
+      } else if (event.key === "ArrowLeft") {
         event.preventDefault();
         void seekTo(videoRef.current.currentTime - 10);
       } else if (event.key === "ArrowRight") {
@@ -559,7 +565,7 @@ export const App = () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
     };
-  }, [fileUrl, seekTo]);
+  }, [fileUrl, seekTo, togglePlay]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -602,6 +608,11 @@ export const App = () => {
           )}
           {tracks.map((track) => {
             const db = dbAverages[track.info.audioIndex];
+            const meterExpanded = Boolean(expandedMeters[track.info.audioIndex]);
+            const clampedDb = db === null || db === undefined
+              ? MIN_METER_DB
+              : Math.max(MIN_METER_DB, Math.min(6, db));
+            const meterPercent = ((clampedDb - MIN_METER_DB) / (6 - MIN_METER_DB)) * 100;
             return (
               <div key={track.info.audioIndex} className="track-row">
                 <div className="track-label">{buildTrackLabel(track.info)}</div>
@@ -625,8 +636,31 @@ export const App = () => {
                     }
                   />
                   <span className="volume-value">{track.volume}%</span>
-                  <span className="db-box">{db === null || db === undefined ? "-∞ dB" : `${db.toFixed(1)} dB`}</span>
+                  <button
+                    className="meter-toggle"
+                    onClick={() => setExpandedMeters((prev) => ({
+                      ...prev,
+                      [track.info.audioIndex]: !prev[track.info.audioIndex]
+                    }))}
+                  >
+                    {meterExpanded ? "Hide Meter" : "Show Meter"}
+                  </button>
                 </div>
+                {meterExpanded && (
+                  <div className="track-meter-wrap">
+                    <div className="track-meter" role="meter" aria-label={`Track ${track.info.audioIndex + 1} level`}>
+                      <div
+                        className="track-meter-fill"
+                        style={{ width: `${meterPercent}%` }}
+                      />
+                      <div className="track-meter-segments" aria-hidden="true">
+                        {Array.from({ length: 20 }).map((_, index) => (
+                          <span key={index} />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {track.error && <div className="error">{track.error}</div>}
               </div>
             );
